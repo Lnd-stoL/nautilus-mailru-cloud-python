@@ -1,5 +1,6 @@
 
 from gi.repository import Nautilus, GObject
+import urllib
 import lib_nautilus_mailru_cloud as lib_nmrc
 
 
@@ -10,7 +11,9 @@ class MailRuCloudExtension(GObject.GObject, Nautilus.MenuProvider):
 
     def menu_get_public_link(self, menu, file):
         #print "menu_activate_cb",file
-        lib_nmrc.copy_public_link(file.get_uri().replace('file://', ''))
+        path = urllib.unquote(file.get_uri().replace('file://', '')).decode('utf8')
+        print path
+        lib_nmrc.copy_public_link(path)
 
 
     def get_file_items(self, window, files):
@@ -23,7 +26,7 @@ class MailRuCloudExtension(GObject.GObject, Nautilus.MenuProvider):
 
         top_mailru_item = Nautilus.MenuItem(
             name="MailRuCloudExtension::TopMenu",
-            label="Cloud Mail.Ru" + str(file.get_uri())
+            label="Mail.Ru Cloud"
         )
 
         mailru_submenu = Nautilus.Menu()
