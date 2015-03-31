@@ -4,18 +4,15 @@ from gi.repository import Notify
 import sys
 import subprocess
 import ConfigParser
-from os.path import expanduser
+from os.path import expanduser, isfile
 
 # TODO: move to /usr/lib
 sys.path.append('../PyMailCloud/')
-from pymailcloud import PyMailCloud
+from PyMailCloud import PyMailCloud
 
 
 mail_icon = "/usr/share/icons/hicolor/256x256/apps/mail.ru-cloud.png"
-Notify.init ("nautilus-mail-cloud")
-
-mail_cloud = PyMailCloud("test-cloud-api@mail.ru", "test-cloud-api123")
-
+Notify.init("nautilus-mail-cloud")
 
 __mailru_cloud_path = ""
 def get_mailru_cloud_path():
@@ -34,6 +31,35 @@ def get_mailru_cloud_email():
         configParser.read(expanduser("~") + "/.config/Mail.Ru/Mail.Ru_Cloud.conf")
         __email = configParser.get('General', 'email')
     return __email
+
+__password = ""
+def get_mailru_cloud_password():
+    global __password
+    if __password == "":
+        config_filename = expanduser("~") + "/.config/Mail.Ru/Mail.Ru_Cloud-Nautilus.conf"
+        if isfile(config_filename):
+            configParser = ConfigParser.RawConfigParser()
+            configParser.read(config_filename)
+            __password = configParser.get('General', 'password')
+    return __password
+
+
+mail_cloud = None
+def init():
+    global mail_cloud
+    if get_mailru_cloud_email() != "" and get_mailru_cloud_password() != "":
+        mail_cloud = PyMailCloud(get_mailru_cloud_email(), get_mailru_cloud_password())
+
+
+def save_config(password):
+    config_filename = expanduser("~") + "/.config/Mail.Ru/Mail.Ru_Cloud-Nautilus.conf"
+    configParser = ConfigParser.RawConfigParser()
+    configParser.add_section('General')
+    configParser.set('General', 'password', password)
+
+    with open(config_filename, 'wb') as configfile:
+        configParser.write(configfile)
+
 
 def to_clipboard(string):
     p = subprocess.Popen(['xclip', '-selection', 'c'], stdin=subprocess.PIPE)
