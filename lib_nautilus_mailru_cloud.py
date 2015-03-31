@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 
 from gi.repository import Notify
-import pyperclip
 import sys
 import subprocess
 import ConfigParser
