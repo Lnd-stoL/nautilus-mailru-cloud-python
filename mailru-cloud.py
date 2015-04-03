@@ -6,20 +6,25 @@ __version__ = "0.1"
 # tunables
 
 PYMAILCLOUD_PATH = '../PyMailCloud/'
-NOTIFY_ICON = '/usr/share/icons/hicolor/256x256/apps/mail.ru-cloud.png'
 CONFIG_PATH = '/.config/Mail.Ru/Mail.Ru_Cloud-NautilusExtension.conf'
 MAILRU_CONFIG_PATH = '/.config/Mail.Ru/Mail.Ru_Cloud.conf'
+
+NOTIFY_ICON = '/usr/share/icons/hicolor/256x256/apps/mail.ru-cloud.png'
+EMBLEM_ACTUAL  = 'stock_calc-accept'
+EMBLEM_SHARED  = 'applications-roleplaying'
+EMBLEM_SYNCING = 'stock_refresh'
 
 #-----------------------------------------------------------------------------------------------------------------------
 # imports
 
 from gi.repository import Nautilus, GObject, Gtk, Notify
-from os.path import expanduser, isfile
+import os.path as os_path
 
 import sys
 import subprocess
 import ConfigParser
 import urllib
+import json
 
 sys.path.append(PYMAILCLOUD_PATH)
 from PyMailCloud import PyMailCloud, PyMailCloudError
@@ -100,6 +105,7 @@ class MailCloudClient:
 
     def __init__(self):
         self.is_configured = False
+        self._folder_info_cache = {}
 
         Notify.init("nautilus-mail-cloud")
         self._load_mailru_config()
@@ -109,14 +115,14 @@ class MailCloudClient:
     def _load_mailru_config(self):
         try:
             config = ConfigParser.ConfigParser()
-            config.read(expanduser("~") + MAILRU_CONFIG_PATH)
+            config.read(os_path.expanduser("~") + MAILRU_CONFIG_PATH)
         except (ConfigParser.ParsingError, IOError):
             raise MailCloudClientError.CloudNotInstalledError()
 
-        self.mailru_user = MailCloudClient.User()
+        self._mailru_user = MailCloudClient.User()
         try:
-            self.mailru_user.email = config.get('General', 'email')
-            self.cloud_local_dir   = config.get('General', 'folder')
+            self._mailru_user.email = config.get('General', 'email')
+            self._cloud_local_dir   = config.get('General', 'folder')
         except ConfigParser.Error as err:
             raise MailCloudClientError.UnconfiguredError('invalid config format: ' + err.message)
 
@@ -124,8 +130,8 @@ class MailCloudClient:
     def _load_config(self):
         try:
             config = ConfigParser.ConfigParser()
-            config.read(expanduser("~") + CONFIG_PATH)
-            self.mailru_user.password = config.get('User', 'password')
+            config.read(os_path.expanduser("~") + CONFIG_PATH)
+            self._mailru_user.password = config.get('User', 'password')
             self.is_configured = True
 
         except (IOError, ConfigParser.Error) as err:
@@ -136,9 +142,9 @@ class MailCloudClient:
     def _save_config(self):
         config = ConfigParser.ConfigParser()
         config.add_section('User')
-        config.set('User', 'password', self.mailru_user.password)
+        config.set('User', 'password', self._mailru_user.password)
 
-        with open(expanduser("~") + CONFIG_PATH, 'wb') as config_file:
+        with open(os_path.expanduser("~") + CONFIG_PATH, 'wb') as config_file:
             config.write(config_file)
 
         self.is_configured = True
@@ -150,7 +156,7 @@ class MailCloudClient:
         dlg.destroy()
         if password_str is None: return False  # configuration cancelled by user
 
-        self.mailru_user.password = password_str
+        self._mailru_user.password = password_str
 
         try:
             self._save_config()
@@ -165,7 +171,7 @@ class MailCloudClient:
     def _ensure_pymalicloud_initialized(self):
         try: self.py_mail_cloud
         except AttributeError:
-            self.py_mail_cloud = PyMailCloud(self.mailru_user.email, self.mailru_user.password)
+            self.py_mail_cloud = PyMailCloud(self._mailru_user.email, self._mailru_user.password)
 
 
     def _decode_uri(self, path_uri):
@@ -175,17 +181,66 @@ class MailCloudClient:
 
     def local_path_is_in_cloud(self, path_uri):
         local_path = self._decode_uri(path_uri)
-        return local_path.startswith(self.cloud_local_dir)
+        return local_path.startswith(self._cloud_local_dir) and len(local_path) > len(self._cloud_local_dir)
 
 
     def to_relative_path(self, path_uri):
         local_path = self._decode_uri(path_uri)
-        return local_path[len(self.cloud_local_dir):]
+        return local_path[len(self._cloud_local_dir):]
 
 
     def get_public_link(self, path_uri):
         self._ensure_pymalicloud_initialized()
         return self.py_mail_cloud.get_public_link(self.to_relative_path(path_uri))
+
+
+    def _load_folder_info(self, path):
+        if path in self._folder_info_cache: return self._folder_info_cache[path]
+
+        self._ensure_pymalicloud_initialized()
+        folder_info_raw = self.py_mail_cloud.get_folder_contents(path)
+        folder_info = { 'files':{}, 'folders':[] }
+        folder_info_files = folder_info['files']
+
+        for entry in folder_info_raw['body']['list']:
+            if entry['kind'] == 'file':
+                file_entry = { 'mtime': int(entry['mtime']) }
+                if 'weblink' in entry:
+                    file_entry['weblink'] = entry['weblink']
+                folder_info_files[entry['home']] = file_entry
+
+        self._folder_info_cache[path] = folder_info
+        return folder_info
+
+
+    FILE_STATE_INSYNC  = 1
+    FILE_STATE_ACTUAL  = 2
+    FILE_STATE_SHARED  = 3
+    FILE_STATE_UNKNOWN = 4
+
+    def local_file_state(self, path_uri):
+        local_file_path = self._decode_uri(path_uri)
+        if os_path.isdir(local_file_path): return self.FILE_STATE_UNKNOWN
+
+        rel_file_path = self.to_relative_path(path_uri)
+        rel_dir_name = os_path.dirname(rel_file_path)
+        folder_info = self._load_folder_info(rel_dir_name)
+
+        if not rel_file_path in folder_info['files']: return self.FILE_STATE_INSYNC
+        file_info = folder_info['files'][rel_file_path]
+        if file_info['mtime'] == int(os_path.getmtime(local_file_path)):
+            if 'weblink' in file_info: return self.FILE_STATE_SHARED
+            else:                      return self.FILE_STATE_ACTUAL
+        else: return self.FILE_STATE_INSYNC
+
+
+    def invalidate_folder_info(self, path_uri):
+        local_file_path = self._decode_uri(path_uri)
+        if not os_path.isdir(local_file_path): return
+
+        rel_file_path = self.to_relative_path(path_uri)
+        rel_dir_name = os_path.dirname(rel_file_path)
+        del self._folder_info_cache[rel_dir_name]
 
 
 #-----------------------------------------------------------------------------------------------------------------------
@@ -219,19 +274,41 @@ class MailRuCloudExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.Info
             name="MailRuCloudExtension::GetPublicLink",
             label="Copy public link to '%s'" % file.get_name()
         )
-        public_link_item.connect('activate', self.on_menu_get_public_link, file)
+        public_link_item.connect('activate', self._on_menu_get_public_link, file)
         mailru_submenu.append_item(public_link_item)
 
         return [top_mailru_item]
 
 
     def update_file_info(self, file):
-        if not self.mailru_client.local_path_is_in_cloud(file.get_uri()): return
-        file.add_emblem("default")
+        try: self.mailru_client
+        except AttributeError: return # extensions is unitialized
 
-    #------------------------------------------------- menu handlers ---------------------------------------------------
+        if file.get_uri_scheme() != 'file':
+            return
 
-    def on_menu_get_public_link(self, menu, file):
+        if not self.mailru_client.local_path_is_in_cloud(file.get_uri()):
+            return  # no emblems outside cloud dir
+
+        GObject.timeout_add_seconds(0, self._update_file_info_async, file, False)
+
+    #--------------------------------------------------- handlers ------------------------------------------------------
+
+    def _update_file_info_async(self, file, reload):
+        emblemes = { self.mailru_client.FILE_STATE_ACTUAL  : EMBLEM_ACTUAL,
+                     self.mailru_client.FILE_STATE_INSYNC  : EMBLEM_SYNCING,
+                     self.mailru_client.FILE_STATE_SHARED  : EMBLEM_SHARED,
+                     self.mailru_client.FILE_STATE_UNKNOWN : ''}
+
+        self.mailru_client
+        file.add_emblem(emblemes[self.mailru_client.local_file_state(file.get_uri())])
+
+        if reload: self.mailru_client.invalidate_folder_info(file.get_uri())
+        GObject.timeout_add_seconds(5, self._update_file_info_async, file, True)
+        return False
+
+
+    def _on_menu_get_public_link(self, menu, file):
         if not self.mailru_client.is_configured:
             if not self.mailru_client.configure_with_gui():
                 return  # the user refused configuration
