@@ -1,13 +1,13 @@
 #! /bin/bash
 
-nautilus -q
+EXTENSIONS_DIR="/usr/share/nautilus-python/extensions"
 
-rm /usr/share/nautilus-python/extensions/mailru-cloud.py
-rm /usr/share/nautilus-python/extensions/mailru-cloud.pyc
-cp ./mailru-cloud.py /usr/share/nautilus-python/extensions/mailru-cloud.py
-cp ../PyMailCloud/PyMailCloud.py /usr/share/nautilus-python/extensions/PyMailCloud.py
-cd /usr/share/nautilus-python/extensions
+cp ./mailru-cloud.py $EXTENSIONS_DIR/mailru-cloud.py
+cp ../PyMailCloud/PyMailCloud.py $EXTENSIONS_DIR/PyMailCloud.py
+
+cd $EXTENSIONS_DIR
 chmod 777 ./mailru-cloud.py
 
+nautilus -q
 nautilus --no-desktop 
 
