@@ -9,10 +9,13 @@ PYMAILCLOUD_PATH = '../PyMailCloud/'
 CONFIG_PATH = '/.config/Mail.Ru/Mail.Ru_Cloud-NautilusExtension.conf'
 MAILRU_CONFIG_PATH = '/.config/Mail.Ru/Mail.Ru_Cloud.conf'
 
-NOTIFY_ICON = '/usr/share/icons/hicolor/256x256/apps/mail.ru-cloud.png'
+NOTIFY_ICON    = '/usr/share/icons/hicolor/256x256/apps/mail.ru-cloud.png'
 EMBLEM_ACTUAL  = 'stock_calc-accept'
 EMBLEM_SHARED  = 'applications-roleplaying'
 EMBLEM_SYNCING = 'stock_refresh'
+
+FOLDER_INFO_REFRESH_RATE = 3    # in seconds
+
 
 #-----------------------------------------------------------------------------------------------------------------------
 # imports
@@ -25,6 +28,7 @@ import subprocess
 import ConfigParser
 import urllib
 import json
+import time
 
 sys.path.append(PYMAILCLOUD_PATH)
 from PyMailCloud import PyMailCloud, PyMailCloudError
@@ -195,11 +199,14 @@ class MailCloudClient:
 
 
     def _load_folder_info(self, path):
-        if path in self._folder_info_cache: return self._folder_info_cache[path]
+        if path in self._folder_info_cache:
+            folder_info = self._folder_info_cache[path]
+            if int(time.time()) - folder_info['time'] <= FOLDER_INFO_REFRESH_RATE:
+                return folder_info
 
         self._ensure_pymalicloud_initialized()
         folder_info_raw = self.py_mail_cloud.get_folder_contents(path)
-        folder_info = { 'files':{}, 'folders':[] }
+        folder_info = { 'files':{}, 'folders':[], 'time':int(time.time()) }
         folder_info_files = folder_info['files']
 
         for entry in folder_info_raw['body']['list']:
@@ -226,21 +233,19 @@ class MailCloudClient:
         rel_dir_name = os_path.dirname(rel_file_path)
         folder_info = self._load_folder_info(rel_dir_name)
 
-        if not rel_file_path in folder_info['files']: return self.FILE_STATE_INSYNC
+        if not rel_file_path in folder_info['files']: return self.FILE_STATE_INSYNC    # no remote version of this file
         file_info = folder_info['files'][rel_file_path]
-        if file_info['mtime'] == int(os_path.getmtime(local_file_path)):
-            if 'weblink' in file_info: return self.FILE_STATE_SHARED
-            else:                      return self.FILE_STATE_ACTUAL
-        else: return self.FILE_STATE_INSYNC
 
+        try:
+            if file_info['mtime'] == int(os_path.getmtime(local_file_path)):   # outdated copy
+                if 'weblink' in file_info: return self.FILE_STATE_SHARED       # has public link or not
+                else:                      return self.FILE_STATE_ACTUAL
 
-    def invalidate_folder_info(self, path_uri):
-        local_file_path = self._decode_uri(path_uri)
-        if not os_path.isdir(local_file_path): return
+            else: return self.FILE_STATE_INSYNC
 
-        rel_file_path = self.to_relative_path(path_uri)
-        rel_dir_name = os_path.dirname(rel_file_path)
-        del self._folder_info_cache[rel_dir_name]
+        except OSError:                                                        # strange issue with deleted files
+            return self.FILE_STATE_UNKNOWN                                     # being asked for even after removing
+
 
 
 #-----------------------------------------------------------------------------------------------------------------------
@@ -290,21 +295,26 @@ class MailRuCloudExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.Info
         if not self.mailru_client.local_path_is_in_cloud(file.get_uri()):
             return  # no emblems outside cloud dir
 
-        GObject.timeout_add_seconds(0, self._update_file_info_async, file, False)
+        GObject.timeout_add_seconds(0, self._update_file_info_async, file)
 
     #--------------------------------------------------- handlers ------------------------------------------------------
 
-    def _update_file_info_async(self, file, reload):
-        emblemes = { self.mailru_client.FILE_STATE_ACTUAL  : EMBLEM_ACTUAL,
-                     self.mailru_client.FILE_STATE_INSYNC  : EMBLEM_SYNCING,
-                     self.mailru_client.FILE_STATE_SHARED  : EMBLEM_SHARED,
-                     self.mailru_client.FILE_STATE_UNKNOWN : ''}
+    def _update_file_info_async(self, file):
+        emblems = { self.mailru_client.FILE_STATE_ACTUAL  : EMBLEM_ACTUAL,
+                    self.mailru_client.FILE_STATE_INSYNC  : EMBLEM_SYNCING,
+                    self.mailru_client.FILE_STATE_SHARED  : EMBLEM_SHARED,
+                    self.mailru_client.FILE_STATE_UNKNOWN : ''}
 
-        self.mailru_client
-        file.add_emblem(emblemes[self.mailru_client.local_file_state(file.get_uri())])
+        print 'setting emblem ' + file.get_uri()
+        file.add_emblem(emblems[self.mailru_client.local_file_state(file.get_uri())])
+        GObject.timeout_add_seconds(FOLDER_INFO_REFRESH_RATE+1, self._invalidate_info_async, file)
+        return False
 
-        if reload: self.mailru_client.invalidate_folder_info(file.get_uri())
-        GObject.timeout_add_seconds(5, self._update_file_info_async, file, True)
+
+    def _invalidate_info_async(self, file):
+        file.invalidate_extension_info()
+        print "updating ... " + file.get_uri()
+        #GObject.timeout_add_seconds(FOLDER_INFO_REFRESH_RATE+1, self._invalidate_info_async, file)
         return False
 
 
