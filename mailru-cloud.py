@@ -14,21 +14,23 @@ EMBLEM_ACTUAL  = 'stock_calc-accept'
 EMBLEM_SHARED  = 'applications-roleplaying'
 EMBLEM_SYNCING = 'stock_refresh'
 
-FOLDER_INFO_REFRESH_RATE = 3    # in seconds
+FOLDER_INFO_REFRESH_RATE = 1    # in seconds
+FILE_INFO_REFRESH_RATE = 800  # in ms
 
 
 #-----------------------------------------------------------------------------------------------------------------------
 # imports
 
-from gi.repository import Nautilus, GObject, Gtk, Notify
+from gi.repository import Nautilus, GObject, Gtk, Notify, Gio, GLib
+from threading import Thread
 import os.path as os_path
 
 import sys
 import subprocess
 import ConfigParser
 import urllib
-import json
 import time
+import Queue
 
 sys.path.append(PYMAILCLOUD_PATH)
 from PyMailCloud import PyMailCloud, PyMailCloudError
@@ -107,13 +109,37 @@ class MailCloudClient:
         password = '<unset>'
 
 
+    class LocalFileInfo:
+        weblink = None
+        mtime = None
+        was_updated = False
+
+
+    class LocalFileState:
+        UNKNOWN = 0,
+        IN_SYNC = 1,
+        SHARED  = 2,
+        ACTUAL  = 3
+
+
+    class LocalDirectoryInfo:
+        pass
+
+
     def __init__(self):
         self.is_configured = False
-        self._folder_info_cache = {}
+        self._cur_display_dir = ''
+        self._net_ops_queue = Queue.Queue()
+        self._net_ops_set = set()
+        self._local_file_info_cache = {}
 
         Notify.init("nautilus-mail-cloud")
         self._load_mailru_config()
         self._load_config()
+
+        net_thread = Thread(target=self._net_thread_worker)
+        net_thread.daemon = False
+        net_thread.start()
 
 
     def _load_mailru_config(self):
@@ -172,80 +198,167 @@ class MailCloudClient:
         return True   # configured ok
 
 
-    def _ensure_pymalicloud_initialized(self):
+    def _ensure_pymailcloud_initialized(self):
         try: self.py_mail_cloud
         except AttributeError:
+            print 'initializing cloud@mail.ru API connection ...'
             self.py_mail_cloud = PyMailCloud(self._mailru_user.email, self._mailru_user.password)
 
 
-    def _decode_uri(self, path_uri):
+    def _decode_uri(self, local_path_uri):
         uri_prefix = 'file://'
-        return urllib.unquote(path_uri[len(uri_prefix):]).decode('utf8')
+        return urllib.unquote(local_path_uri[len(uri_prefix):]).decode('utf8')
 
 
-    def local_path_is_in_cloud(self, path_uri):
-        local_path = self._decode_uri(path_uri)
+    def local_path_is_in_cloud(self, local_path_uri):
+        local_path = self._decode_uri(local_path_uri)
         return local_path.startswith(self._cloud_local_dir) and len(local_path) > len(self._cloud_local_dir)
 
 
-    def to_relative_path(self, path_uri):
-        local_path = self._decode_uri(path_uri)
+    def to_cloud_relative_path(self, local_path_uri):
+        local_path = self._decode_uri(local_path_uri)
         return local_path[len(self._cloud_local_dir):]
 
 
-    def get_public_link(self, path_uri):
-        self._ensure_pymalicloud_initialized()
-        return self.py_mail_cloud.get_public_link(self.to_relative_path(path_uri))
+    def get_public_link(self, local_path_uri):
+        self._ensure_pymailcloud_initialized()
+        public_link = self.py_mail_cloud.get_public_link(self.to_cloud_relative_path(local_path_uri))
+
+        try:
+            file_info = self._get_cached_fileinfo(local_path_uri)
+            file_info.weblink = public_link
+            file_info.was_updated = True
+        except KeyError:
+            pass
+
+        return public_link
 
 
-    def _load_folder_info(self, path):
-        if path in self._folder_info_cache:
-            folder_info = self._folder_info_cache[path]
-            if int(time.time()) - folder_info['time'] <= FOLDER_INFO_REFRESH_RATE:
-                return folder_info
+    def _net_load_folder_info(self, local_dir_uri):
+        cloud_rel_dir = self.to_cloud_relative_path(local_dir_uri + '/')
 
-        self._ensure_pymalicloud_initialized()
-        folder_info_raw = self.py_mail_cloud.get_folder_contents(path)
-        folder_info = { 'files':{}, 'folders':[], 'time':int(time.time()) }
-        folder_info_files = folder_info['files']
+        self._ensure_pymailcloud_initialized()
+        print 'net: getting folder content for ', cloud_rel_dir, '\n'
+        folder_info_raw = self.py_mail_cloud.get_folder_contents(cloud_rel_dir)
+        print 'net: ready', '\n'
 
         for entry in folder_info_raw['body']['list']:
             if entry['kind'] == 'file':
-                file_entry = { 'mtime': int(entry['mtime']) }
+
+                try:
+                    old_file_info = self._local_file_info_cache[entry['home']]
+                except KeyError:
+                    old_file_info = MailCloudClient.LocalFileInfo
+
+                file_info = MailCloudClient.LocalFileInfo()
+                file_info.mtime = int(entry['mtime'])
                 if 'weblink' in entry:
-                    file_entry['weblink'] = entry['weblink']
-                folder_info_files[entry['home']] = file_entry
+                    file_info.weblink = entry['weblink']
 
-        self._folder_info_cache[path] = folder_info
-        return folder_info
+                file_info.was_updated = old_file_info.mtime != file_info.mtime or \
+                                        old_file_info.weblink != file_info.weblink
+                self._local_file_info_cache[entry['home']] = file_info
+
+        dir_info = MailCloudClient.LocalDirectoryInfo()
+        print 'saving', cloud_rel_dir
+        self._local_file_info_cache[cloud_rel_dir] = dir_info
 
 
-    FILE_STATE_INSYNC  = 1
-    FILE_STATE_ACTUAL  = 2
-    FILE_STATE_SHARED  = 3
-    FILE_STATE_UNKNOWN = 4
-
-    def local_file_state(self, path_uri):
+    def get_local_file_state(self, path_uri):
+        cloud_rel_path = self.to_cloud_relative_path(path_uri)
         local_file_path = self._decode_uri(path_uri)
-        if os_path.isdir(local_file_path): return self.FILE_STATE_UNKNOWN
-
-        rel_file_path = self.to_relative_path(path_uri)
-        rel_dir_name = os_path.dirname(rel_file_path)
-        folder_info = self._load_folder_info(rel_dir_name)
-
-        if not rel_file_path in folder_info['files']: return self.FILE_STATE_INSYNC    # no remote version of this file
-        file_info = folder_info['files'][rel_file_path]
 
         try:
-            if file_info['mtime'] == int(os_path.getmtime(local_file_path)):   # outdated copy
-                if 'weblink' in file_info: return self.FILE_STATE_SHARED       # has public link or not
-                else:                      return self.FILE_STATE_ACTUAL
+            file_info = self._local_file_info_cache[cloud_rel_path]
+        except KeyError:
+            cloud_rel_dir = self.to_cloud_relative_path(os_path.dirname(path_uri) + '/')
+            print 'asking', cloud_rel_dir
+            if cloud_rel_dir in self._local_file_info_cache:
+                return MailCloudClient.LocalFileState.IN_SYNC    # it seems cloud knows nothing about this file yet
+            else:
+                print "unknown"
+                return MailCloudClient.LocalFileState.UNKNOWN    # no info about this file
 
-            else: return self.FILE_STATE_INSYNC
+        try:
+            if file_info.mtime == int(os_path.getmtime(local_file_path)):                         # test if outdated copy
+                if not file_info.weblink is None: return MailCloudClient.LocalFileState.SHARED    # has public link or not
+                else:                             return MailCloudClient.LocalFileState.ACTUAL
+            else: return MailCloudClient.LocalFileState.IN_SYNC
 
         except OSError:                                                        # strange issue with deleted files
-            return self.FILE_STATE_UNKNOWN                                     # being asked for even after removing
+            return MailCloudClient.LocalFileState.UNKNOWN                      # being asked for even after removing
 
+
+    def _net_thread_worker(self):
+        while True:
+            item = self._net_ops_queue.get()
+            self._net_load_folder_info(item)
+            self._net_ops_set.remove(item)
+            self._net_ops_queue.task_done()
+
+
+    def change_display_dir(self, local_path_uri):
+        local_path = self._decode_uri(local_path_uri)
+        if self._cur_display_dir != local_path:
+            self._cur_display_dir = local_path
+            self.shedule_folder_info_update(local_path_uri)
+
+
+    def shedule_folder_info_update(self, local_dir_uri):
+        if local_dir_uri in self._net_ops_set: return
+        self._net_ops_set.add(local_dir_uri)
+        self._net_ops_queue.put(local_dir_uri)
+
+
+    def _get_cached_fileinfo(self, local_path_uri):
+        return self._local_file_info_cache[self.to_cloud_relative_path(local_path_uri)]
+
+
+    def was_file_info_updated(self, local_path_uri):
+        try:
+            file_info = self._get_cached_fileinfo(local_path_uri)
+            if file_info.was_updated:
+                file_info.was_updated = False
+                return True
+            return False
+
+        except KeyError:
+            rel_dir_path = self.to_cloud_relative_path(os_path.dirname(local_path_uri) + '/')
+            if rel_dir_path in self._local_file_info_cache: return True
+            return False
+
+
+    def file_has_public_link(self, local_path_uri):
+        try:
+            file_info = self._get_cached_fileinfo(local_path_uri)
+            return file_info.weblink is not None
+
+        except KeyError:
+            return False
+
+
+    def get_file_weblink(self, local_path_uri):
+        try:
+            file_info = self._get_cached_fileinfo(local_path_uri)
+            return file_info.weblink
+
+        except KeyError:
+            return None
+
+
+    def remove_file_public_link(self, local_path_uri):
+        try:
+            file_info = self._get_cached_fileinfo(local_path_uri)
+            weblink = file_info.weblink
+
+            self._ensure_pymailcloud_initialized()
+            self.py_mail_cloud.remove_public_link(weblink)
+
+            file_info.weblink = None
+            file_info.was_updated = True
+
+        except KeyError:
+            pass
 
 
 #-----------------------------------------------------------------------------------------------------------------------
@@ -254,6 +367,10 @@ class MailCloudClient:
 class MailRuCloudExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.InfoProvider):
 
     def __init__(self):
+        self.emblems = { MailCloudClient.LocalFileState.ACTUAL  : EMBLEM_ACTUAL,
+                         MailCloudClient.LocalFileState.IN_SYNC : EMBLEM_SYNCING,
+                         MailCloudClient.LocalFileState.SHARED  : EMBLEM_SHARED,
+                         MailCloudClient.LocalFileState.UNKNOWN : ''}
         try:
             self.mailru_client = MailCloudClient()
         except MailCloudClientError.CloudNotInstalledError as err:
@@ -265,57 +382,83 @@ class MailRuCloudExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.Info
 
     def get_file_items(self, window, files):
         try: self.mailru_client
-        except AttributeError: return  # extensions is unitialized
+        except AttributeError: return  # extensions was not correctly itialized
 
         if len(files) != 1 or not self.mailru_client.local_path_is_in_cloud(files[0].get_uri()):
             return    # nothing to do with multiple selected files or outside mail.ru cloud directory
         file = files[0]
 
+        if file.get_uri_scheme() != 'file':
+            return    # unsupported uri scheme
+
         top_mailru_item = Nautilus.MenuItem(name="MailRuCloudExtension::TopMenu", label="Cloud@Mail.ru")
         mailru_submenu = Nautilus.Menu()
         top_mailru_item.set_submenu(mailru_submenu)
 
-        public_link_item = Nautilus.MenuItem(
+        get_public_link_item = Nautilus.MenuItem(
             name="MailRuCloudExtension::GetPublicLink",
             label="Copy public link to '%s'" % file.get_name()
         )
-        public_link_item.connect('activate', self._on_menu_get_public_link, file)
-        mailru_submenu.append_item(public_link_item)
+        get_public_link_item.connect('activate', self._on_menu_get_public_link, file)
+        mailru_submenu.append_item(get_public_link_item)
+
+        if self.mailru_client.file_has_public_link(file.get_uri()):
+            remove_public_link_item = Nautilus.MenuItem(
+                name="MailRuCloudExtension::RemovePublicLink",
+                label="Remove public link to '%s'" % file.get_name()
+            )
+            remove_public_link_item.connect('activate', self._on_menu_remove_public_link, file)
+            mailru_submenu.append_item(remove_public_link_item)
 
         return [top_mailru_item]
 
 
     def update_file_info(self, file):
         try: self.mailru_client
-        except AttributeError: return # extensions is unitialized
+        except AttributeError: return  # extensions was not correctly itialized
 
         if file.get_uri_scheme() != 'file':
-            return
+            return    # unsupported uri scheme
 
         if not self.mailru_client.local_path_is_in_cloud(file.get_uri()):
-            return  # no emblems outside cloud dir
+            return    # no emblems outside cloud dir
 
-        GObject.timeout_add_seconds(0, self._update_file_info_async, file)
+        if not file.is_directory():
+            print 'getting ', file.get_uri()
+            self.mailru_client.change_display_dir(os_path.dirname(file.get_uri()))
+            emblem = self.emblems[self.mailru_client.get_local_file_state(file.get_uri())]
+            file.add_emblem(emblem)
+            GObject.timeout_add(FILE_INFO_REFRESH_RATE, self._invalidate_info_async, file)
 
     #--------------------------------------------------- handlers ------------------------------------------------------
 
-    def _update_file_info_async(self, file):
-        emblems = { self.mailru_client.FILE_STATE_ACTUAL  : EMBLEM_ACTUAL,
-                    self.mailru_client.FILE_STATE_INSYNC  : EMBLEM_SYNCING,
-                    self.mailru_client.FILE_STATE_SHARED  : EMBLEM_SHARED,
-                    self.mailru_client.FILE_STATE_UNKNOWN : ''}
-
-        print 'setting emblem ' + file.get_uri()
-        file.add_emblem(emblems[self.mailru_client.local_file_state(file.get_uri())])
-        GObject.timeout_add_seconds(FOLDER_INFO_REFRESH_RATE+1, self._invalidate_info_async, file)
-        return False
-
-
     def _invalidate_info_async(self, file):
-        file.invalidate_extension_info()
-        print "updating ... " + file.get_uri()
-        #GObject.timeout_add_seconds(FOLDER_INFO_REFRESH_RATE+1, self._invalidate_info_async, file)
-        return False
+        self.mailru_client.shedule_folder_info_update(os_path.dirname(file.get_uri()))
+        if self.mailru_client.was_file_info_updated(file.get_uri()):
+            print "updating ... " + file.get_uri()
+            file.invalidate_extension_info()
+            return False
+        return True
+
+
+    def _on_menu_remove_public_link(self, menu, file):
+        if not self.mailru_client.is_configured:
+            if not self.mailru_client.configure_with_gui():
+                return  # the user refused configuration
+
+        notification_text = 'Could not remove public link'
+        try:
+            public_url = self.mailru_client.remove_file_public_link(file.get_uri())
+            notification_text = 'Public link removed successfully'
+
+        except PyMailCloudError.AuthError:
+            ErrorDialog('Mail.Ru autentification failed. Maybe password is incorrect.').show()
+
+        except Exception as err:
+            print(err)
+
+        notification = Notify.Notification.new("Cloud@Mail.ru", notification_text, NOTIFY_ICON)
+        notification.show()
 
 
     def _on_menu_get_public_link(self, menu, file):
