@@ -5,11 +5,13 @@ __version__ = "0.1"
 #-----------------------------------------------------------------------------------------------------------------------
 # tunables
 
-ENABLE_EXPERIMENTAL = False
+ENABLE_EXPERIMENTAL = False     # switch to enable or disable experemental (not tested well enough or known not to work properly)
+                                # functionallity; currently such features as file state indicating icons or removing public links
+
 
 PYMAILCLOUD_PATH   = '../PyMailCloud/'
-CONFIG_PATH        = '/.config/Mail.Ru/Mail.Ru_Cloud-NautilusExtension.conf'
-MAILRU_CONFIG_PATH = '/.config/Mail.Ru/Mail.Ru_Cloud.conf'
+CONFIG_PATH        = '/.config/Mail.Ru/Mail.Ru_Cloud-NautilusExtension.conf'    # relative to home dir
+MAILRU_CONFIG_PATH = '/.config/Mail.Ru/Mail.Ru_Cloud.conf'                      # path to official client config (relative to home dir)
 
 NOTIFY_ICON    = '/usr/share/icons/hicolor/256x256/apps/mail.ru-cloud.png'
 EMBLEM_ACTUAL  = 'stock_calc-accept'
