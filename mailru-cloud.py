@@ -5,8 +5,10 @@ __version__ = "0.1"
 #-----------------------------------------------------------------------------------------------------------------------
 # tunables
 
-PYMAILCLOUD_PATH = '../PyMailCloud/'
-CONFIG_PATH = '/.config/Mail.Ru/Mail.Ru_Cloud-NautilusExtension.conf'
+ENABLE_EXPERIMENTAL = False
+
+PYMAILCLOUD_PATH   = '../PyMailCloud/'
+CONFIG_PATH        = '/.config/Mail.Ru/Mail.Ru_Cloud-NautilusExtension.conf'
 MAILRU_CONFIG_PATH = '/.config/Mail.Ru/Mail.Ru_Cloud.conf'
 
 NOTIFY_ICON    = '/usr/share/icons/hicolor/256x256/apps/mail.ru-cloud.png'
@@ -15,7 +17,9 @@ EMBLEM_SHARED  = 'applications-roleplaying'
 EMBLEM_SYNCING = 'stock_refresh'
 
 FOLDER_INFO_REFRESH_RATE = 1    # in seconds
-FILE_INFO_REFRESH_RATE = 800  # in ms
+FILE_INFO_REFRESH_RATE   = 800  # in ms
+
+LOG_PREFIX = 'nautilus-mailru-cloud: '
 
 
 #-----------------------------------------------------------------------------------------------------------------------
@@ -137,9 +141,10 @@ class MailCloudClient:
         self._load_mailru_config()
         self._load_config()
 
-        net_thread = Thread(target=self._net_thread_worker)
-        net_thread.daemon = False
-        net_thread.start()
+        if ENABLE_EXPERIMENTAL:
+            net_thread = Thread(target=self._net_thread_worker)
+            net_thread.daemon = False
+            net_thread.start()
 
 
     def _load_mailru_config(self):
@@ -165,7 +170,7 @@ class MailCloudClient:
             self.is_configured = True
 
         except (IOError, ConfigParser.Error) as err:
-            print(err)
+            print(LOG_PREFIX + err.message)
             self.is_configured = False
 
 
@@ -184,15 +189,15 @@ class MailCloudClient:
         dlg = PasswordEntryDialog()
         password_str = dlg.run()
         dlg.destroy()
-        if password_str is None: return False  # configuration cancelled by user
+        if password_str is None: return False   # configuration cancelled by user
 
         self._mailru_user.password = password_str
 
         try:
             self._save_config()
         except (IOError, ConfigParser.Error) as err:
-            print(err)
-            # todo: handle error
+            print(LOG_PREFIX + err.message)
+            # todo: handle error here
             return False
 
         return True   # configured ok
@@ -201,7 +206,7 @@ class MailCloudClient:
     def _ensure_pymailcloud_initialized(self):
         try: self.py_mail_cloud
         except AttributeError:
-            print 'initializing cloud@mail.ru API connection ...'
+            print LOG_PREFIX + 'initializing cloud@mail.ru API connection ...'
             self.py_mail_cloud = PyMailCloud(self._mailru_user.email, self._mailru_user.password)
 
 
@@ -223,6 +228,9 @@ class MailCloudClient:
     def get_public_link(self, local_path_uri):
         self._ensure_pymailcloud_initialized()
         public_link = self.py_mail_cloud.get_public_link(self.to_cloud_relative_path(local_path_uri))
+
+
+        if not ENABLE_EXPERIMENTAL: return public_link
 
         try:
             file_info = self._get_cached_fileinfo(local_path_uri)
@@ -374,22 +382,27 @@ class MailRuCloudExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.Info
         try:
             self.mailru_client = MailCloudClient()
         except MailCloudClientError.CloudNotInstalledError as err:
-            print(err)
+            print(LOG_PREFIX + err)
             ErrorDialog('Unable to initialize Cloud@MailRu extension: ' + err.message).show()
 
-        print 'Cloud@Mail.ru extension ver.' +  __version__ + ' initialized'
+        print LOG_PREFIX + 'Cloud@Mail.ru extension ver.' +  __version__ + ' initialized'
+
+    #--------------------------------------------- extensions interface ------------------------------------------------
+
+    def get_background_items(self, window, files):
+        return []
 
 
     def get_file_items(self, window, files):
         try: self.mailru_client
-        except AttributeError: return  # extensions was not correctly itialized
+        except AttributeError: return []  # extensions was not correctly itialized
 
         if len(files) != 1 or not self.mailru_client.local_path_is_in_cloud(files[0].get_uri()):
-            return    # nothing to do with multiple selected files or outside mail.ru cloud directory
+            return []    # nothing to do with multiple selected files or outside mail.ru cloud directory
         file = files[0]
 
         if file.get_uri_scheme() != 'file':
-            return    # unsupported uri scheme
+            return []    # unsupported uri scheme
 
         top_mailru_item = Nautilus.MenuItem(name="MailRuCloudExtension::TopMenu", label="Cloud@Mail.ru")
         mailru_submenu = Nautilus.Menu()
@@ -402,18 +415,21 @@ class MailRuCloudExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.Info
         get_public_link_item.connect('activate', self._on_menu_get_public_link, file)
         mailru_submenu.append_item(get_public_link_item)
 
-        if self.mailru_client.file_has_public_link(file.get_uri()):
-            remove_public_link_item = Nautilus.MenuItem(
-                name="MailRuCloudExtension::RemovePublicLink",
-                label="Remove public link to '%s'" % file.get_name()
-            )
-            remove_public_link_item.connect('activate', self._on_menu_remove_public_link, file)
-            mailru_submenu.append_item(remove_public_link_item)
+        if ENABLE_EXPERIMENTAL:    # also experimental
+            if self.mailru_client.file_has_public_link(file.get_uri()):
+                remove_public_link_item = Nautilus.MenuItem(
+                    name="MailRuCloudExtension::RemovePublicLink",
+                    label="Remove public link to '%s'" % file.get_name()
+                )
+                remove_public_link_item.connect('activate', self._on_menu_remove_public_link, file)
+                mailru_submenu.append_item(remove_public_link_item)
 
         return [top_mailru_item]
 
 
     def update_file_info(self, file):
+        if not ENABLE_EXPERIMENTAL: return    # file status icons are not stable right now
+
         try: self.mailru_client
         except AttributeError: return  # extensions was not correctly itialized
 
@@ -424,7 +440,7 @@ class MailRuCloudExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.Info
             return    # no emblems outside cloud dir
 
         if not file.is_directory():
-            print 'getting ', file.get_uri()
+            # print 'getting ', file.get_uri()    # debug printing
             self.mailru_client.change_display_dir(os_path.dirname(file.get_uri()))
             emblem = self.emblems[self.mailru_client.get_local_file_state(file.get_uri())]
             file.add_emblem(emblem)
@@ -453,9 +469,10 @@ class MailRuCloudExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.Info
 
         except PyMailCloudError.AuthError:
             ErrorDialog('Mail.Ru autentification failed. Maybe password is incorrect.').show()
+            if not self.mailru_client.configure_with_gui(): return
 
         except Exception as err:
-            print(err)
+            print(LOG_PREFIX + 'error while removing public link: ' + err)
 
         notification = Notify.Notification.new("Cloud@Mail.ru", notification_text, NOTIFY_ICON)
         notification.show()
@@ -474,14 +491,25 @@ class MailRuCloudExtension(GObject.GObject, Nautilus.MenuProvider, Nautilus.Info
 
         except PyMailCloudError.AuthError:
             ErrorDialog('Mail.Ru autentification failed. Maybe password is incorrect.').show()
+            if not self.mailru_client.configure_with_gui(): return
 
         except Exception as err:
-            print(err)
+            print(LOG_PREFIX + 'error while getting public link: ' + err.message)
 
         notification = Notify.Notification.new("Cloud@Mail.ru", notification_text, NOTIFY_ICON)
         notification.show()
 
 
     def _to_clipboard(self, data):
-        p = subprocess.Popen(['xclip', '-selection', 'c'], stdin=subprocess.PIPE)
-        p.communicate(input=data.encode("utf-8"))
+        try:
+            proc = subprocess.Popen(['xclip', '-selection', 'c'], stdin=subprocess.PIPE)
+        except OSError as err:
+            ErrorDialog('Failed to run xclip command. Maybe xclip is not installed? (' + err.message + ')').show();
+            raise err
+
+        try:
+            outs, errs = proc.communicate(input=data.encode("utf-8"))
+        except TimeoutExpired as err:
+            proc.kill()
+            ErrorDialog('Failed to communicate to xclip due to timeout. (' + err.message + ')').show();
+            raise err
